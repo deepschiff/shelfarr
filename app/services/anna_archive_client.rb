@@ -53,7 +53,13 @@ class AnnaArchiveClient
   MAX_TITLE_BYTES = 1.kilobyte
   MAX_AUTHOR_BYTES = 512
   MAX_PARSE_DURATION = 2.seconds
-  HttpResponse = Data.define(:status, :body)
+  MAX_LOGIN_RESPONSE_BYTES = 256.kilobytes
+  MEMBER_SESSION_COOKIE = "aa_account_id2"
+  HttpResponse = Data.define(:status, :body, :location, :cookies) do
+    def initialize(status:, body:, location: nil, cookies: [])
+      super
+    end
+  end
 
   class << self
     # Check if Anna's Archive is configured (has API key)
@@ -136,6 +142,7 @@ class AnnaArchiveClient
     def reset_connection!
       @connections = nil
       @working_base_url = nil
+      @member_sessions = nil
     end
 
     # Test the search interface rather than accepting any homepage returning 200.
@@ -189,8 +196,13 @@ class AnnaArchiveClient
       raise SearchCancelled, "Search ownership changed"
     end
 
+    # Anna's Archive redirects anonymous page requests to a browser check that
+    # FlareSolverr cannot solve, but signed-in members skip it. Search directly
+    # with a member session first, then fall back to FlareSolverr.
     def fetch_with_protection_bypass(path, base_url:)
       url = "#{base_url}#{path}"
+      response = fetch_as_member(path, base_url: base_url)
+      return response.body if usable_page?(response)
 
       if FlaresolverrClient.configured?
         Rails.logger.info "[AnnaArchiveClient] Using FlareSolverr for request"
@@ -204,12 +216,9 @@ class AnnaArchiveClient
 
         html
       else
-        response = capped_get(base_url, path, max_bytes: MAX_SEARCH_RESPONSE_BYTES)
-
-        # Detect bot protection
-        if response.status == 403 || bot_protection_detected?(response.body)
-          raise BotProtectionError, "Anna's Archive requires FlareSolverr to bypass DDoS protection. " \
-                                    "Please configure FlareSolverr URL in settings."
+        if protection_challenge?(response)
+          raise BotProtectionError, "Anna's Archive blocked the search and member sign-in did not bypass it. " \
+                                    "Check the Anna's Archive API key, or configure FlareSolverr URL in settings."
         end
 
         raise RetryableError, "Search failed with status #{response.status}" unless response.status == 200
@@ -219,6 +228,58 @@ class AnnaArchiveClient
       raise ConfigurationError, "Refused Anna's Archive URL: #{e.message}"
     rescue FlaresolverrClient::Error => e
       raise ConnectionError, "FlareSolverr error: #{e.message}"
+    end
+
+    def fetch_as_member(path, base_url:)
+      response = get_page(base_url, path, member_sessions[base_url])
+      return response unless protection_challenge?(response)
+
+      member_sessions.delete(base_url)
+      cookie = sign_in_member(base_url)
+      return response unless cookie
+
+      get_page(base_url, path, cookie)
+    end
+
+    def get_page(base_url, path, cookie)
+      headers = cookie ? { "Cookie" => cookie } : {}
+      capped_get(base_url, path, max_bytes: MAX_SEARCH_RESPONSE_BYTES, headers: headers)
+    end
+
+    def usable_page?(response)
+      response.status == 200 && !bot_protection_detected?(response.body)
+    end
+
+    def protection_challenge?(response)
+      response.status == 403 ||
+        bot_protection_detected?(response.body) ||
+        (response.status.between?(300, 399) && response.location.to_s.include?("check=1"))
+    end
+
+    def member_sessions
+      @member_sessions ||= {}
+    end
+
+    # Signs in with the member secret key the same way the account page form
+    # does. A valid key answers with a redirect that sets the session cookie;
+    # an invalid key re-renders the form without one.
+    def sign_in_member(base_url)
+      response = capped_post_form(base_url, "/account/", { key: api_key }, max_bytes: MAX_LOGIN_RESPONSE_BYTES)
+      cookie = response.cookies.filter_map do |set_cookie|
+        pair = set_cookie.split(";", 2).first.to_s.strip
+        pair if pair.start_with?("#{MEMBER_SESSION_COOKIE}=") && pair.length > MEMBER_SESSION_COOKIE.length + 1
+      end.first
+
+      if cookie
+        Rails.logger.info "[AnnaArchiveClient] Signed in with member key on #{base_url}"
+        member_sessions[base_url] = cookie
+      else
+        Rails.logger.warn "[AnnaArchiveClient] Member sign-in on #{base_url} returned no session (status #{response.status})"
+        nil
+      end
+    rescue ConnectionError, RetryableError, ResponseTooLargeError => e
+      Rails.logger.warn "[AnnaArchiveClient] Member sign-in on #{base_url} failed: #{e.message}"
+      nil
     end
 
     def bot_protection_detected?(html)
@@ -320,13 +381,32 @@ class AnnaArchiveClient
       SettingsService.get(:anna_archive_api_key)
     end
 
-    def capped_get(base_url, path, params = nil, max_bytes:)
-      body = +""
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + MAX_RESPONSE_DURATION
+    def capped_get(base_url, path, params = nil, max_bytes:, headers: {})
       uri = URI.join("#{base_url}/", path)
       query = URI.decode_www_form(uri.query.to_s)
       params&.each { |key, value| query << [ key.to_s, value.to_s ] }
       uri.query = URI.encode_www_form(query) if query.any?
+
+      capped_request(uri, max_bytes: max_bytes) do |request_uri|
+        Net::HTTP::Get.new(request_uri).tap do |request|
+          headers.each { |name, value| request[name] = value }
+        end
+      end
+    end
+
+    def capped_post_form(base_url, path, form, max_bytes:)
+      uri = URI.join("#{base_url}/", path)
+
+      capped_request(uri, max_bytes: max_bytes) do |request_uri|
+        Net::HTTP::Post.new(request_uri).tap { |request| request.set_form_data(form) }
+      end
+    end
+
+    # Redirects are not followed: Anna's Archive signals its browser check and
+    # member sign-in through redirect responses.
+    def capped_request(uri, max_bytes:)
+      body = +""
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + MAX_RESPONSE_DURATION
       endpoint = OutboundUrlGuard.validate!(uri.to_s)
       raise ConfigurationError, "Anna's Archive URL must use https" unless endpoint.use_ssl?
 
@@ -339,7 +419,7 @@ class AnnaArchiveClient
         open_timeout: 10,
         read_timeout: 30
       ) do |http|
-        request = Net::HTTP::Get.new(endpoint.uri)
+        request = yield(endpoint.uri)
         request["User-Agent"] = "Shelfarr/1.0"
         http.request(request) do |incoming|
           response = incoming
@@ -360,7 +440,12 @@ class AnnaArchiveClient
         end
       end
 
-      HttpResponse.new(status: response.code.to_i, body: body)
+      HttpResponse.new(
+        status: response.code.to_i,
+        body: body,
+        location: response["Location"],
+        cookies: Array(response.get_fields("Set-Cookie"))
+      )
     rescue OutboundUrlGuard::BlockedUrlError => e
       raise ConfigurationError, "Refused Anna's Archive URL: #{e.message}"
     rescue SocketError, IOError, EOFError, Timeout::Error, Net::ProtocolError, OpenSSL::SSL::SSLError, SystemCallError => e

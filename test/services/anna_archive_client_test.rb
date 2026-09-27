@@ -3,6 +3,8 @@
 require "test_helper"
 
 class AnnaArchiveClientTest < ActiveSupport::TestCase
+  MEMBER_COOKIE = "aa_account_id2=member-session"
+
   setup do
     SettingsService.set(:anna_archive_enabled, true)
     SettingsService.set(:anna_archive_url, "https://annas-archive.org")
@@ -368,6 +370,7 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
     VCR.turned_off do
       stub_request(:get, /annas-archive\.org\/search/)
         .to_return(status: 403, body: "Forbidden")
+      stub_anna_member_sign_in(success: false)
 
       error = assert_raises AnnaArchiveClient::BotProtectionError do
         AnnaArchiveClient.search("test query")
@@ -381,6 +384,7 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
     VCR.turned_off do
       stub_request(:get, /annas-archive\.org\/search/)
         .to_return(status: 200, body: "<html>DDoS-Guard protection</html>")
+      stub_anna_member_sign_in(success: false)
 
       error = assert_raises AnnaArchiveClient::BotProtectionError do
         AnnaArchiveClient.search("test query")
@@ -396,6 +400,7 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
 
       stub_request(:get, /annas-archive\.org\/search/)
         .to_return(status: 403, body: "Forbidden")
+      stub_anna_member_sign_in(success: false)
       stub_request(:get, /offline\.example\/search/)
         .to_raise(Faraday::ConnectionFailed.new("Connection failed"))
 
@@ -413,6 +418,8 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
     VCR.turned_off do
       SettingsService.set(:flaresolverr_url, "http://localhost:8191")
 
+      stub_anna_search_challenge
+      stub_anna_member_sign_in(success: false)
       stub_flaresolverr_with_search_results
       results = AnnaArchiveClient.search("test book")
 
@@ -421,6 +428,95 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
       assert_equal "0123456789abcdef0123456789abcdef", results.first.md5
 
       SettingsService.set(:flaresolverr_url, "")
+    end
+  end
+
+  test "search signs in with the member key when anonymous search is challenged" do
+    VCR.turned_off do
+      stub_anna_search_challenge
+      sign_in = stub_anna_member_sign_in
+      member_search = stub_anna_search_with_results(cookie: MEMBER_COOKIE)
+
+      results = AnnaArchiveClient.search("test book")
+
+      assert_equal "0123456789abcdef0123456789abcdef", results.first.md5
+      assert_requested sign_in, times: 1
+      assert_requested member_search, times: 1
+    end
+  end
+
+  test "search reuses the member session for later searches" do
+    VCR.turned_off do
+      stub_anna_search_challenge
+      sign_in = stub_anna_member_sign_in
+      member_search = stub_anna_search_with_results(cookie: MEMBER_COOKIE)
+
+      AnnaArchiveClient.search("first book")
+      AnnaArchiveClient.search("second book")
+
+      assert_requested(:get, /annas-archive\.org\/search/, times: 1) { |request| request.headers["Cookie"].nil? }
+      assert_requested sign_in, times: 1
+      assert_requested member_search, times: 2
+    end
+  end
+
+  test "search signs in again when the member session has expired" do
+    VCR.turned_off do
+      stub_anna_search_challenge
+      stub_request(:get, /annas-archive\.org\/search/)
+        .with(headers: { "Cookie" => "aa_account_id2=expired-session" })
+        .to_return(status: 302, headers: { "Location" => "https://annas-archive.org/search?q=test&check=1" })
+      sign_in = stub_anna_member_sign_in
+      stub_anna_search_with_results(cookie: MEMBER_COOKIE)
+      AnnaArchiveClient.send(:member_sessions)["https://annas-archive.org"] = "aa_account_id2=expired-session"
+
+      results = AnnaArchiveClient.search("test book")
+
+      assert_equal "0123456789abcdef0123456789abcdef", results.first.md5
+      assert_requested sign_in, times: 1
+    end
+  end
+
+  test "search prefers a member session over FlareSolverr" do
+    VCR.turned_off do
+      SettingsService.set(:flaresolverr_url, "http://localhost:8191")
+      stub_anna_search_challenge
+      stub_anna_member_sign_in
+      stub_anna_search_with_results(cookie: MEMBER_COOKIE)
+      flaresolverr = stub_request(:post, "http://localhost:8191/v1")
+
+      results = AnnaArchiveClient.search("test book")
+
+      assert_equal "0123456789abcdef0123456789abcdef", results.first.md5
+      assert_not_requested flaresolverr
+    end
+  end
+
+  test "search falls back to FlareSolverr when member sign-in fails" do
+    VCR.turned_off do
+      SettingsService.set(:flaresolverr_url, "http://localhost:8191")
+      stub_anna_search_challenge
+      sign_in = stub_anna_member_sign_in(success: false)
+      stub_flaresolverr_with_search_results
+
+      results = AnnaArchiveClient.search("test book")
+
+      assert_equal "0123456789abcdef0123456789abcdef", results.first.md5
+      assert_requested sign_in, times: 1
+      assert_requested :post, "http://localhost:8191/v1"
+    end
+  end
+
+  test "search reports bot protection when member sign-in cannot connect" do
+    VCR.turned_off do
+      stub_anna_search_challenge
+      stub_request(:post, "https://annas-archive.org/account/").to_raise(Errno::ECONNRESET)
+
+      error = assert_raises AnnaArchiveClient::BotProtectionError do
+        AnnaArchiveClient.search("test query")
+      end
+
+      assert_includes error.message, "API key"
     end
   end
 
@@ -486,7 +582,28 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
       )
   end
 
-  def stub_anna_search_with_results
+  def stub_anna_search_challenge
+    stub_request(:get, /annas-archive\.org\/search/)
+      .to_return(status: 302, headers: { "Location" => "https://annas-archive.org/search?q=test&check=1" })
+  end
+
+  def stub_anna_member_sign_in(success: true)
+    stub = stub_request(:post, "https://annas-archive.org/account/")
+      .with(body: { "key" => "test-api-key" })
+    if success
+      stub.to_return(
+        status: 302,
+        headers: {
+          "Location" => "https://annas-archive.org/account/",
+          "Set-Cookie" => "#{MEMBER_COOKIE}; Domain=annas-archive.org; Secure; HttpOnly; Path=/; SameSite=Lax"
+        }
+      )
+    else
+      stub.to_return(status: 200, body: "<html><form action=\"/account/\"></form></html>")
+    end
+  end
+
+  def stub_anna_search_with_results(cookie: nil)
     html = <<~HTML
       <html>
         <body>
@@ -504,8 +621,9 @@ class AnnaArchiveClientTest < ActiveSupport::TestCase
       </html>
     HTML
 
-    stub_request(:get, /annas-archive\.org\/search/)
-      .to_return(status: 200, body: html)
+    stub = stub_request(:get, /annas-archive\.org\/search/)
+    stub = stub.with(headers: { "Cookie" => cookie }) if cookie
+    stub.to_return(status: 200, body: html)
   end
 
   def stub_anna_download_api
