@@ -1208,6 +1208,46 @@ class DownloadJobTest < ActiveJob::TestCase
     assert_equal "direct", @zlibrary_download.download_type
   end
 
+  test "Anna's Archive comic download goes to the comic output path with the comic filename" do
+    Dir.mktmpdir do |ebook_dir|
+      Dir.mktmpdir do |comic_dir|
+        SettingsService.set(:ebook_output_path, ebook_dir)
+        SettingsService.set(:comicbook_output_path, comic_dir)
+        SettingsService.set(:comicbook_path_template, "{series/}{title}")
+        SettingsService.set(:comicbook_filename_template, "{seriesNum:00 - }{title} - {author}")
+
+        body = "%PDF-1.7\n" + ("x" * 1024)
+        book = Book.create!(title: "xxxHOLiC, Vol. 1", author: "CLAMP", series: "xxxHOLiC",
+                            series_position: "1", book_type: :comicbook)
+        request = Request.create!(book: book, user: users(:one), status: :downloading)
+        result = request.search_results.create!(
+          guid: Digest::MD5.hexdigest(body),
+          title: "xxxHolic Volume 1",
+          indexer: "Anna's Archive",
+          source: SearchResult::SOURCE_ANNA_ARCHIVE,
+          status: :selected
+        )
+        download = request.downloads.create!(name: result.title, search_result: result, status: :queued)
+
+        VCR.turned_off do
+          AnnaArchiveClient.stub :get_download_url, "https://files.test/xxxholic-v1.pdf" do
+            stub_request(:get, "https://files.test/xxxholic-v1.pdf")
+              .to_return(status: 200, body: body, headers: { "Content-Type" => "application/pdf" })
+
+            DownloadJob.perform_now(download.id)
+          end
+        end
+
+        download.reload
+        assert download.completed?, "download status: #{download.status}"
+        assert_equal File.join(comic_dir, "xxxHOLiC", "xxxHOLiC, Vol. 1", "01 - xxxHOLiC, Vol. 1 - CLAMP.pdf"),
+          download.download_path
+        assert File.exist?(download.download_path)
+        assert_empty Dir.glob(File.join(ebook_dir, "**", "*.pdf"))
+      end
+    end
+  end
+
   test "Project Gutenberg download completes via direct http download" do
     Dir.mktmpdir do |dir|
       setup_gutenberg_download(output_path: dir)
