@@ -181,7 +181,8 @@ class DirectDownloadFileService
     def output_roots
       configured = [
         SettingsService.get(:ebook_output_path, default: "/ebooks"),
-        SettingsService.get(:audiobook_output_path, default: "/audiobooks")
+        SettingsService.get(:audiobook_output_path, default: "/audiobooks"),
+        SettingsService.get(:comicbook_output_path, default: "/comics")
       ].compact_blank
       persisted = Download.where.not(direct_output_root: nil).distinct.pluck(:direct_output_root)
       (configured + persisted).map { |root| Pathname(root).expand_path.to_s }.uniq

@@ -511,7 +511,7 @@ class DownloadJob < ApplicationJob
     book = download.request.book
 
     # Build destination path similar to how PostProcessingJob does it
-    base_path = SettingsService.get(:ebook_output_path, default: "/ebooks")
+    base_path = direct_download_output_path(book)
     destination_dir = PathTemplateService.build_destination(
       book,
       base_path: base_path,
@@ -519,8 +519,18 @@ class DownloadJob < ApplicationJob
       search_result: search_result
     )
 
-    # Infer filename from URL or search result
-    filename = infer_filename_from_url(download_url, search_result)
+    # Comics follow the comic filename template like torrent imports do; ebooks
+    # keep the source's filename.
+    filename = if book.comicbook?
+      PathTemplateService.build_filename(
+        book,
+        ".#{infer_extension(download_url, search_result)}",
+        request: download.request,
+        search_result: search_result
+      )
+    else
+      infer_filename_from_url(download_url, search_result)
+    end
     destination_path = File.join(destination_dir, filename)
 
     Rails.logger.info "[DownloadJob] Downloading directly to: #{destination_path}"
@@ -575,6 +585,14 @@ class DownloadJob < ApplicationJob
     else
       file_service&.cleanup_after_run!
       fail_direct_dispatch!(download, e, message: "Direct download failed: #{e.message}")
+    end
+  end
+
+  def direct_download_output_path(book)
+    if book.comicbook?
+      SettingsService.get(:comicbook_output_path, default: "/comics")
+    else
+      SettingsService.get(:ebook_output_path, default: "/ebooks")
     end
   end
 

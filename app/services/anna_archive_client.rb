@@ -44,6 +44,8 @@ class AnnaArchiveClient
   EBOOK_FILE_TYPES = %w[epub pdf].freeze
   AUDIOBOOK_FILE_TYPES = %w[zip].freeze
   BOOK_CONTENT_TYPES = %w[book_nonfiction book_fiction book_unknown].freeze
+  # Manga volumes are mostly filed as ordinary books; Anna's comic category holds the rest.
+  COMIC_CONTENT_TYPES = (BOOK_CONTENT_TYPES + %w[book_comic]).freeze
   MAX_SEARCH_RESPONSE_BYTES = 10.megabytes
   MAX_API_RESPONSE_BYTES = 1.megabyte
   MAX_DOWNLOAD_URL_BYTES = 8.kilobytes

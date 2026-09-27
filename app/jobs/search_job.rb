@@ -59,7 +59,8 @@ class SearchJob < ApplicationJob
 
     # Check if any search sources are configured
     indexer_available = IndexerClient.configured?
-    anna_available = AnnaArchiveClient.configured? && (request.book.ebook? || request.book.audiobook?)
+    anna_available = AnnaArchiveClient.configured? &&
+      (request.book.ebook? || request.book.audiobook? || request.book.comicbook?)
     zlibrary_available = ZLibraryClient.configured? && request.book.ebook?
     gutenberg_available = GutenbergClient.configured? && request.book.ebook?
     librivox_available = LibrivoxClient.configured? && request.book.audiobook?
@@ -365,6 +366,13 @@ class SearchJob < ApplicationJob
     SearchTitleVariantService.call(book.title)
   end
 
+  def anna_content_types(book)
+    return [] if book.audiobook?
+    return AnnaArchiveClient::COMIC_CONTENT_TYPES if book.comicbook?
+
+    AnnaArchiveClient::BOOK_CONTENT_TYPES
+  end
+
   def search_anna_archive(request, search_generation)
     book = request.book
     language = request.effective_language
@@ -377,7 +385,7 @@ class SearchJob < ApplicationJob
       AnnaArchiveClient.search(
         query_parts.join(" "),
         file_types: book.audiobook? ? AnnaArchiveClient::AUDIOBOOK_FILE_TYPES : AnnaArchiveClient::EBOOK_FILE_TYPES,
-        content_types: book.audiobook? ? [] : AnnaArchiveClient::BOOK_CONTENT_TYPES,
+        content_types: anna_content_types(book),
         language: language,
         after_attempt: -> { heartbeat_search!(request, search_generation) }
       )

@@ -846,6 +846,24 @@ class SearchJobTest < ActiveJob::TestCase
     assert_equal [ @request ], attention_requests
   end
 
+  test "searches Anna's Archive for comic requests including the comic category" do
+    SettingsService.set(:prowlarr_api_key, "")
+    @request.book.update!(book_type: :comicbook, title: "xxxHOLiC, Vol. 1", author: "CLAMP")
+    searched_content_types = nil
+
+    AnnaArchiveClient.stub :configured?, true do
+      AnnaArchiveClient.stub :search, ->(*, content_types:, **) {
+        searched_content_types = content_types
+        []
+      } do
+        SearchJob.perform_now(@request.id)
+      end
+    end
+
+    assert_equal AnnaArchiveClient::COMIC_CONTENT_TYPES, searched_content_types
+    assert_includes searched_content_types, "book_comic"
+  end
+
   test "does not mark for attention when auto-select succeeds" do
     SettingsService.set(:auto_select_enabled, true)
 
